@@ -55,6 +55,12 @@ class ExecutionEngine:
         # Load initial instrument info
         self._preload_instrument_info()
 
+    def _get_decimal_count(self, value_str: str) -> int:
+        """Extract decimal count from a numeric string (e.g. '0.001' → 3, '1' → 0)"""
+        if "." in value_str:
+            return len(value_str.split(".")[-1])
+        return 0
+
     def _preload_instrument_info(self):
         """Preload instrument info for common symbols"""
         try:
@@ -62,9 +68,17 @@ class ExecutionEngine:
             for inst in r.get("result", {}).get("list", []):
                 symbol = inst.get("symbol")
                 if symbol:
+                    ls_filter = inst.get("lotSizeFilter", {})
+                    pr_filter = inst.get("priceFilter", {})
+                    qty_step_str = ls_filter.get("qtyStep", "0.001")
+                    tick_size_str = pr_filter.get("tickSize", "0.01")
                     self.instrument_cache[symbol] = {
-                        "qtyStep": float(inst.get("lotSizeFilter", {}).get("qtyStep", "0.001")),
-                        "priceScale": int(inst.get("priceFilter", {}).get("tickSize", "0.01").split(".")[-1].rstrip("0") or "2"),
+                        "qtyStep": float(qty_step_str),
+                        "qtyStepStr": qty_step_str,
+                        "qtyDecimals": self._get_decimal_count(qty_step_str),
+                        "tickSize": float(tick_size_str),
+                        "tickSizeStr": tick_size_str,
+                        "priceDecimals": self._get_decimal_count(tick_size_str),
                     }
             logger.info(f"Preloaded {len(self.instrument_cache)} instrument configs")
         except Exception as e:
@@ -76,13 +90,24 @@ class ExecutionEngine:
             try:
                 r = self.session.get_instruments_info(category=config.CATEGORY, symbol=symbol)
                 inst = r.get("result", {}).get("list", [{}])[0]
+                ls_filter = inst.get("lotSizeFilter", {})
+                pr_filter = inst.get("priceFilter", {})
+                qty_step_str = ls_filter.get("qtyStep", "0.001")
+                tick_size_str = pr_filter.get("tickSize", "0.01")
                 self.instrument_cache[symbol] = {
-                    "qtyStep": float(inst.get("lotSizeFilter", {}).get("qtyStep", "0.001")),
-                    "priceScale": int(inst.get("priceFilter", {}).get("tickSize", "0.01").split(".")[-1].rstrip("0") or "2"),
+                    "qtyStep": float(qty_step_str),
+                    "qtyStepStr": qty_step_str,
+                    "qtyDecimals": self._get_decimal_count(qty_step_str),
+                    "tickSize": float(tick_size_str),
+                    "tickSizeStr": tick_size_str,
+                    "priceDecimals": self._get_decimal_count(tick_size_str),
                 }
             except Exception as e:
                 logger.warning(f"Failed to get instrument info for {symbol}: {e}")
-                self.instrument_cache[symbol] = {"qtyStep": 0.001, "priceScale": 2}
+                self.instrument_cache[symbol] = {
+                    "qtyStep": 0.001, "qtyStepStr": "0.001", "qtyDecimals": 3,
+                    "tickSize": 0.01, "tickSizeStr": "0.01", "priceDecimals": 2,
+                }
         return self.instrument_cache[symbol]
 
     def _reset_daily_stats(self):
@@ -123,27 +148,28 @@ class ExecutionEngine:
         return max(config.MIN_POSITION_SIZE, min(config.MAX_POSITION_SIZE, size))
 
     def _get_dynamic_qty(self, symbol: str, price: float) -> str:
-        """Calculate qty using instrument_info qtyStep"""
+        """Calculate qty using instrument_info qtyStep, enforcing minimum contract size"""
         inst = self._get_instrument_info(symbol)
         qty_step = inst["qtyStep"]
+        decimals = inst["qtyDecimals"]
         
         target_size = self._get_adaptive_position_size()
         raw_qty = target_size / price
         
-        # Round to qtyStep
         qty = round(raw_qty / qty_step) * qty_step
         
-        # Format with correct decimals
-        decimals = max(0, -int(f"{qty_step:.10f}".rstrip("0").split(".")[-1])) if qty_step < 1 else 0
-        if decimals == 0:
-            return str(int(qty))
+        if qty < qty_step:
+            qty = qty_step
+        
         return f"{qty:.{decimals}f}"
 
     def _round_price(self, symbol: str, price: float) -> str:
-        """Round price using instrument_info tickSize"""
+        """Round price to valid tickSize precision"""
         inst = self._get_instrument_info(symbol)
-        price_scale = inst["priceScale"]
-        return f"{round(price, price_scale):.{price_scale}f}"
+        tick_size = inst["tickSize"]
+        decimals = inst["priceDecimals"]
+        rounded = round(price / tick_size) * tick_size
+        return f"{rounded:.{decimals}f}"
 
     def _check_frequency_limit(self) -> bool:
         """Check if trading frequency is within limits"""
@@ -196,9 +222,25 @@ class ExecutionEngine:
             sl_price = price - sl_distance if side == "Buy" else price + sl_distance
             tp_price = price + tp_distance if side == "Buy" else price - tp_distance
 
+            # Validate SL/TP against Bybit rules
+            if side == "Buy":
+                if sl_price >= price:
+                    sl_price = price * 0.998
+                if tp_price <= price:
+                    tp_price = price * 1.002
+            else:
+                if sl_price <= price:
+                    sl_price = price * 1.002
+                if tp_price >= price:
+                    tp_price = price * 0.998
+
             sl_str = self._round_price(symbol, sl_price)
             tp_str = self._round_price(symbol, tp_price)
             qty_str = self._get_dynamic_qty(symbol, price)
+
+            if qty_str == "0" or qty_str == "" or float(qty_str) <= 0:
+                logger.warning(f"[{symbol}] Invalid qty ({qty_str}). Skipping.")
+                return
 
             try:
                 logger.info(
