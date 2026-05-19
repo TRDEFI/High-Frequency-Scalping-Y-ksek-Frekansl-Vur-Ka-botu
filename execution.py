@@ -3,6 +3,7 @@ import time
 import threading
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
+from pybit.exceptions import InvalidRequestError
 import config
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,13 @@ class ExecutionEngine:
             tp_str = self._round_price(symbol, tp_price)
             qty_str = self._get_dynamic_qty(symbol, price)
 
+            # Debug: log qty calculation details
+            notional = float(qty_str) * price
+            logger.info(
+                f"[{symbol}] QTY DEBUG | raw={notional/config.LEVERAGE:.4f} margin | "
+                f"qty={qty_str} | notional=${notional:.2f} | leverage={config.LEVERAGE}x"
+            )
+
             if qty_str == "0" or qty_str == "" or float(qty_str) <= 0:
                 logger.warning(f"[{symbol}] Invalid qty ({qty_str}). Skipping.")
                 return
@@ -281,11 +289,11 @@ class ExecutionEngine:
             try:
                 logger.info(
                     f"[{symbol}] {side.upper()} ({strategy_name}) | "
-                    f"Entry: {price:.4f} | Qty: {qty_str} | "
+                    f"Entry: {price:.4f} | Qty: {qty_str} | Notional: ${notional:.2f} | "
                     f"SL: {sl_str} | TP: {tp_str}"
                 )
 
-                # Step 1: Market order WITHOUT SL/TP to avoid Bybit cancelling conditional orders
+                # Step 1: Try market order WITH SL/TP attached
                 response = self.session.place_order(
                     category=config.CATEGORY,
                     symbol=symbol,
@@ -294,6 +302,8 @@ class ExecutionEngine:
                     qty=qty_str,
                     timeInForce="GTC",
                     positionIdx=0,
+                    stopLoss=sl_str,
+                    takeProfit=tp_str,
                 )
 
                 if response.get("retCode") == 0:
@@ -307,37 +317,67 @@ class ExecutionEngine:
                     self.last_trade_time = now
                     self.trades_last_hour.append(now)
                     self.symbol_last_trade_time[symbol] = now
-                    logger.info(f"[{symbol}] FILLED: {order_id}")
-
-                    # Step 2: Set SL/TP separately via set_trading_stop (with retry)
-                    sl_set = False
-                    for attempt in range(3):
-                        try:
-                            if attempt > 0:
-                                time.sleep(0.5 * attempt)
-                            self.session.set_trading_stop(
-                                category=config.CATEGORY,
-                                symbol=symbol,
-                                side=side,
-                                stopLoss=sl_str,
-                                takeProfit=tp_str,
-                                positionIdx=0,
-                            )
-                            logger.info(f"[{symbol}] SL/TP set: SL={sl_str} TP={tp_str}")
-                            sl_set = True
-                            break
-                        except Exception as sl_e:
-                            if "10001" in str(sl_e):
-                                logger.warning(f"[{symbol}] Position closed before SL/TP set (attempt {attempt+1})")
-                                break
-                            if attempt < 2:
-                                logger.warning(f"[{symbol}] SL/TP retry {attempt+1}: {sl_e}")
-                            else:
-                                logger.error(f"[{symbol}] Failed to set SL/TP after 3 attempts: {sl_e}")
-                    if not sl_set:
-                        logger.warning(f"[{symbol}] Position running WITHOUT SL/TP protection!")
+                    logger.info(f"[{symbol}] FILLED: {order_id} (SL/TP attached)")
                 else:
                     logger.error(f"[{symbol}] REJECTED: {response}")
+
+            except InvalidRequestError as e:
+                err_msg = str(e)
+                # 30208/30209: Market order price outside Bybit price filter limits
+                if "30208" in err_msg or "30209" in err_msg:
+                    logger.warning(f"[{symbol}] Price filter error. Retrying: market first, then SL/TP")
+                    try:
+                        resp = self.session.place_order(
+                            category=config.CATEGORY,
+                            symbol=symbol,
+                            side=side,
+                            orderType="Market",
+                            qty=qty_str,
+                            timeInForce="GTC",
+                            positionIdx=0,
+                        )
+                        if resp.get("retCode") == 0:
+                            oid = resp["result"]["orderId"]
+                            self.active_positions[symbol] = {"side": side, "time": time.time(), "qty": qty_str}
+                            self.trade_count += 1
+                            self.last_trade_time = now
+                            self.trades_last_hour.append(now)
+                            self.symbol_last_trade_time[symbol] = now
+                            logger.info(f"[{symbol}] FILLED (retry): {oid}")
+
+                            # Step 2: Set SL/TP separately via set_trading_stop (with retry)
+                            sl_set = False
+                            for attempt in range(3):
+                                try:
+                                    if attempt > 0:
+                                        time.sleep(0.5 * attempt)
+                                    self.session.set_trading_stop(
+                                        category=config.CATEGORY,
+                                        symbol=symbol,
+                                        side=side,
+                                        stopLoss=sl_str,
+                                        takeProfit=tp_str,
+                                        positionIdx=0,
+                                    )
+                                    logger.info(f"[{symbol}] SL/TP set: SL={sl_str} TP={tp_str}")
+                                    sl_set = True
+                                    break
+                                except Exception as sl_e:
+                                    if "10001" in str(sl_e):
+                                        logger.warning(f"[{symbol}] Position closed before SL/TP set (attempt {attempt+1})")
+                                        break
+                                    if attempt < 2:
+                                        logger.warning(f"[{symbol}] SL/TP retry {attempt+1}: {sl_e}")
+                                    else:
+                                        logger.error(f"[{symbol}] Failed to set SL/TP after 3 attempts: {sl_e}")
+                            if not sl_set:
+                                logger.warning(f"[{symbol}] Position running WITHOUT SL/TP protection!")
+                        else:
+                            logger.error(f"[{symbol}] Retry failed: {resp}")
+                    except Exception as retry_e:
+                        logger.error(f"[{symbol}] Retry error: {retry_e}", exc_info=True)
+                else:
+                    logger.error(f"[{symbol}] Order error: {e}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"[{symbol}] Order error: {e}", exc_info=True)
