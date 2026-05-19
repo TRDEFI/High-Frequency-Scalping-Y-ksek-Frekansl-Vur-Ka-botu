@@ -284,19 +284,33 @@ class ExecutionEngine:
                     self.symbol_last_trade_time[symbol] = now
                     logger.info(f"[{symbol}] FILLED: {order_id}")
 
-                    # Step 2: Set SL/TP separately via set_trading_stop
-                    try:
-                        self.session.set_trading_stop(
-                            category=config.CATEGORY,
-                            symbol=symbol,
-                            side=side,
-                            stopLoss=sl_str,
-                            takeProfit=tp_str,
-                            positionIdx=0,
-                        )
-                        logger.info(f"[{symbol}] SL/TP set: SL={sl_str} TP={tp_str}")
-                    except Exception as sl_e:
-                        logger.error(f"[{symbol}] Failed to set SL/TP: {sl_e}", exc_info=True)
+                    # Step 2: Set SL/TP separately via set_trading_stop (with retry)
+                    sl_set = False
+                    for attempt in range(3):
+                        try:
+                            if attempt > 0:
+                                time.sleep(0.5 * attempt)
+                            self.session.set_trading_stop(
+                                category=config.CATEGORY,
+                                symbol=symbol,
+                                side=side,
+                                stopLoss=sl_str,
+                                takeProfit=tp_str,
+                                positionIdx=0,
+                            )
+                            logger.info(f"[{symbol}] SL/TP set: SL={sl_str} TP={tp_str}")
+                            sl_set = True
+                            break
+                        except Exception as sl_e:
+                            if "10001" in str(sl_e):
+                                logger.warning(f"[{symbol}] Position closed before SL/TP set (attempt {attempt+1})")
+                                break
+                            if attempt < 2:
+                                logger.warning(f"[{symbol}] SL/TP retry {attempt+1}: {sl_e}")
+                            else:
+                                logger.error(f"[{symbol}] Failed to set SL/TP after 3 attempts: {sl_e}")
+                    if not sl_set:
+                        logger.warning(f"[{symbol}] Position running WITHOUT SL/TP protection!")
                 else:
                     logger.error(f"[{symbol}] REJECTED: {response}")
 
