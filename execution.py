@@ -155,7 +155,7 @@ class ExecutionEngine:
         decimals = inst["qtyDecimals"]
         
         target_size = self._get_adaptive_position_size()
-        raw_qty = target_size / price
+        raw_qty = (target_size * config.LEVERAGE) / price
         
         qty = round(raw_qty / qty_step) * qty_step
         
