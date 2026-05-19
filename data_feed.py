@@ -1,4 +1,5 @@
 import logging
+import time
 from pybit.unified_trading import WebSocket
 import config
 
@@ -6,9 +7,10 @@ logger = logging.getLogger(__name__)
 
 class MultiPairDataFeed:
     """
-    MultiPairDataFeed v4.0
+    MultiPairDataFeed v4.1
     Connects to WebSocket and routes messages to correct StrategyProcessor.
     Subscriptions: Orderbook (L2), Klines (1m), Trade Stream
+    Health check: tracks last_seen to detect silent disconnects
     """
     def __init__(self, strategy_map: dict):
         self.strategy_map = strategy_map
@@ -17,9 +19,17 @@ class MultiPairDataFeed:
             channel_type=config.CATEGORY,
         )
         self.pairs = list(strategy_map.keys())
+        self.last_seen = time.time()
+        self._timeout_seconds = 30
+
+    def _mark_seen(self):
+        self.last_seen = time.time()
+
+    def is_alive(self) -> bool:
+        return (time.time() - self.last_seen) < self._timeout_seconds
 
     def handle_orderbook(self, message):
-        """Callback for Orderbook (L2) data."""
+        self._mark_seen()
         data = message.get("data", {})
         if not data:
             return
@@ -32,7 +42,7 @@ class MultiPairDataFeed:
         self.strategy_map[symbol].update_orderbook(data, msg_type=msg_type)
 
     def handle_kline(self, message):
-        """Callback for Kline (Candlestick) data."""
+        self._mark_seen()
         data = message.get("data", [])
         if not data:
             return
@@ -49,7 +59,7 @@ class MultiPairDataFeed:
                 self.strategy_map[symbol].update_kline(kline)
 
     def handle_trade(self, message):
-        """Callback for Trade Stream data (order flow analysis)."""
+        self._mark_seen()
         if not config.ORDER_FLOW_ENABLED:
             return
             
@@ -63,27 +73,24 @@ class MultiPairDataFeed:
                 self.strategy_map[symbol].update_trade(trade)
 
     def start(self):
-        logger.info(f"Starting DataFeed v4.0 for {len(self.pairs)} pairs (Testnet: {config.IS_TESTNET})")
+        logger.info(f"Starting DataFeed v4.1 for {len(self.pairs)} pairs (Testnet: {config.IS_TESTNET})")
 
         chunk_size = 10
         for i in range(0, len(self.pairs), chunk_size):
             chunk = self.pairs[i:i + chunk_size]
-            
-            # Orderbooks
+
             self.ws_public.orderbook_stream(
                 depth=50,
                 symbol=chunk,
                 callback=self.handle_orderbook,
             )
-            
-            # Klines (1m)
+
             self.ws_public.kline_stream(
                 interval=config.KLINE_INTERVAL,
                 symbol=chunk,
                 callback=self.handle_kline,
             )
-            
-            # Trade Stream (for order flow)
+
             if config.ORDER_FLOW_ENABLED:
                 self.ws_public.trade_stream(
                     symbol=chunk,

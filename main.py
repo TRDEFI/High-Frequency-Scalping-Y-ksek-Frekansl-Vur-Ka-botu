@@ -12,7 +12,7 @@ import config
 # Configure Logging with Rotation
 log_handler = logging.handlers.RotatingFileHandler(
     "bot.log",
-    maxBytes=10*1024*1024,  # 10MB
+    maxBytes=10*1024*1024,
     backupCount=5
 )
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -30,21 +30,36 @@ logger = logging.getLogger(__name__)
 class MultiPairBotOrchestrator:
     def __init__(self):
         self.running = False
-        
+
         # 1. Execution Engine
         self.execution_engine = ExecutionEngine()
-        
+
         # 2. Pair Manager
         self.pair_manager = PairManager(self.execution_engine)
         self.pairs = self.pair_manager.get_top_pairs()
-        
+
         # 3. Strategy Processors
         self.strategy_map = {}
         for symbol in self.pairs:
             self.strategy_map[symbol] = StrategyProcessor(symbol, self.execution_engine)
-            
+
         # 4. Data Feed
         self.data_feed = MultiPairDataFeed(self.strategy_map)
+
+    def _reconnect_datafeed(self):
+        """Recreate and restart the data feed"""
+        logger.warning("Reconnecting DataFeed (WebSocket health check triggered)...")
+        try:
+            for symbol in self.strategy_map.values():
+                symbol._indicators_ready = False
+                symbol._ob_snapshot_received = False
+        except Exception:
+            pass
+        self.data_feed.stop()
+        time.sleep(2)
+        self.data_feed = MultiPairDataFeed(self.strategy_map)
+        self.data_feed.start()
+        logger.info("DataFeed reconnected successfully.")
 
     def start(self):
         logger.info("=" * 80)
@@ -71,11 +86,16 @@ class MultiPairBotOrchestrator:
         try:
             while self.running:
                 time.sleep(3)
-                
+
+                # WebSocket health check
+                if not self.data_feed.is_alive():
+                    logger.error(f"DataFeed silent for >30s. Reconnecting...")
+                    self._reconnect_datafeed()
+
                 if self.execution_engine.active_positions:
                     self.execution_engine.update_positions_status()
                     self.execution_engine.update_funding_pnl()
-                    
+
         except KeyboardInterrupt:
             self.stop()
         except Exception as e:
