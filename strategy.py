@@ -327,12 +327,16 @@ class StrategyProcessor:
             return "HIGH"
 
     def _get_dynamic_sl_tp(self, regime: str):
+        base = config.ATR_SL_MULTIPLIER
         if regime == "LOW":
-            return self.atr * 0.3, self.atr * 0.4
+            mult = base
         elif regime == "MEDIUM":
-            return self.atr * 0.5, self.atr * 0.6
+            mult = base * 1.25
         else:
-            return self.atr * 0.8, self.atr * 1.0
+            mult = base * 2.0
+        sl = self.atr * mult
+        tp = sl * config.RISK_REWARD_RATIO
+        return sl, tp
 
     def _confirm_multi_timeframe(self, signal: str) -> bool:
         if not self._3m_ready:

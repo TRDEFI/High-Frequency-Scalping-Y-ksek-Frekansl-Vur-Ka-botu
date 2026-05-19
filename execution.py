@@ -52,6 +52,7 @@ class ExecutionEngine:
         
         # Frequency control
         self.trades_last_hour = []
+        self.symbol_last_trade_time = {}
         
         # Load initial instrument info
         self._preload_instrument_info()
@@ -211,6 +212,12 @@ class ExecutionEngine:
                 return
                 
             now = time.time()
+
+            # Per-symbol cooldown: prevent re-trading same symbol within 5 minutes
+            last_sym = self.symbol_last_trade_time.get(symbol, 0)
+            if now - last_sym < 300:
+                return
+
             if self.consecutive_losses > 0 and (now - self.last_loss_time < config.POST_LOSS_COOLDOWN_SECONDS):
                 return
 
@@ -276,6 +283,7 @@ class ExecutionEngine:
                     self.trade_count += 1
                     self.last_trade_time = now
                     self.trades_last_hour.append(now)
+                    self.symbol_last_trade_time[symbol] = now
                     logger.info(f"[{symbol}] FILLED: {order_id}")
                 else:
                     logger.error(f"[{symbol}] REJECTED: {response}")
@@ -301,6 +309,7 @@ class ExecutionEngine:
                             self.trade_count += 1
                             self.last_trade_time = now
                             self.trades_last_hour.append(now)
+                            self.symbol_last_trade_time[symbol] = now
                             logger.info(f"[{symbol}] FILLED (retry): {oid}")
                             self.session.set_trading_stop(
                                 category=config.CATEGORY,
