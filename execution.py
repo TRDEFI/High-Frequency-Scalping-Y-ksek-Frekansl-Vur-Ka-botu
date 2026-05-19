@@ -242,9 +242,12 @@ class ExecutionEngine:
             if not self._check_frequency_limit():
                 return
 
-            # Spread check: reject if bid-ask spread > 2%
+            # Spread check: reject if bid-ask spread > 2% or orderbook unavailable
             spread_pct = self._get_spread_pct(symbol)
-            if spread_pct is not None and spread_pct > 2.0:
+            if spread_pct is None:
+                logger.warning(f"[{symbol}] Orderbook unavailable (no bids/asks). Skipping.")
+                return
+            if spread_pct > 2.0:
                 logger.warning(f"[{symbol}] Spread too high: {spread_pct:.1f}% (max 2%). Skipping.")
                 return
 
