@@ -3,7 +3,6 @@ import time
 import threading
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
-from pybit.exceptions import InvalidRequestError
 import config
 
 logger = logging.getLogger(__name__)
@@ -261,6 +260,7 @@ class ExecutionEngine:
                     f"SL: {sl_str} | TP: {tp_str}"
                 )
 
+                # Step 1: Market order WITHOUT SL/TP to avoid Bybit cancelling conditional orders
                 response = self.session.place_order(
                     category=config.CATEGORY,
                     symbol=symbol,
@@ -268,9 +268,7 @@ class ExecutionEngine:
                     orderType="Market",
                     qty=qty_str,
                     timeInForce="GTC",
-                    positionIdx=0, 
-                    stopLoss=sl_str,
-                    takeProfit=tp_str,
+                    positionIdx=0,
                 )
 
                 if response.get("retCode") == 0:
@@ -285,47 +283,22 @@ class ExecutionEngine:
                     self.trades_last_hour.append(now)
                     self.symbol_last_trade_time[symbol] = now
                     logger.info(f"[{symbol}] FILLED: {order_id}")
-                else:
-                    logger.error(f"[{symbol}] REJECTED: {response}")
 
-            except InvalidRequestError as e:
-                err_msg = str(e)
-                # 30208/30209: Market order price outside Bybit price filter limits
-                if "30208" in err_msg or "30209" in err_msg:
-                    logger.warning(f"[{symbol}] Price limit ({err_msg[:60]}...). Retrying: market first, then SL/TP")
+                    # Step 2: Set SL/TP separately via set_trading_stop
                     try:
-                        resp = self.session.place_order(
+                        self.session.set_trading_stop(
                             category=config.CATEGORY,
                             symbol=symbol,
                             side=side,
-                            orderType="Market",
-                            qty=qty_str,
-                            timeInForce="GTC",
+                            stopLoss=sl_str,
+                            takeProfit=tp_str,
                             positionIdx=0,
                         )
-                        if resp.get("retCode") == 0:
-                            oid = resp["result"]["orderId"]
-                            self.active_positions[symbol] = {"side": side, "time": time.time(), "qty": qty_str}
-                            self.trade_count += 1
-                            self.last_trade_time = now
-                            self.trades_last_hour.append(now)
-                            self.symbol_last_trade_time[symbol] = now
-                            logger.info(f"[{symbol}] FILLED (retry): {oid}")
-                            self.session.set_trading_stop(
-                                category=config.CATEGORY,
-                                symbol=symbol,
-                                side=side,
-                                stopLoss=sl_str,
-                                takeProfit=tp_str,
-                                positionIdx=0,
-                            )
-                            logger.info(f"[{symbol}] SL/TP set post-fill")
-                        else:
-                            logger.error(f"[{symbol}] Retry failed: {resp}")
-                    except Exception as retry_e:
-                        logger.error(f"[{symbol}] Retry error: {retry_e}", exc_info=True)
+                        logger.info(f"[{symbol}] SL/TP set: SL={sl_str} TP={tp_str}")
+                    except Exception as sl_e:
+                        logger.error(f"[{symbol}] Failed to set SL/TP: {sl_e}", exc_info=True)
                 else:
-                    logger.error(f"[{symbol}] Order error: {e}", exc_info=True)
+                    logger.error(f"[{symbol}] REJECTED: {response}")
 
             except Exception as e:
                 logger.error(f"[{symbol}] Order error: {e}", exc_info=True)
