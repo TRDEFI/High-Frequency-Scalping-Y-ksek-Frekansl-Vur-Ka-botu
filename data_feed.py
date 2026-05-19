@@ -91,7 +91,7 @@ class MultiPairDataFeed:
                 self.strategy_map[symbol].update_trade(trade)
 
     def start(self):
-        logger.info(f"Starting DataFeed v4.1 for {len(self.pairs)} pairs (Testnet: {config.IS_TESTNET})")
+        logger.info(f"Starting DataFeed v4.2 for {len(self.pairs)} pairs (Testnet: {config.IS_TESTNET})")
 
         chunk_size = 10
         for i in range(0, len(self.pairs), chunk_size):
