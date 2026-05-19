@@ -172,6 +172,22 @@ class ExecutionEngine:
         rounded = round(price / tick_size) * tick_size
         return f"{rounded:.{decimals}f}"
 
+    def _get_spread_pct(self, symbol: str):
+        """Get bid-ask spread percentage. Returns None if orderbook unavailable."""
+        try:
+            r = self.session.get_orderbook(category=config.CATEGORY, symbol=symbol, limit=1)
+            book = r.get("result", {})
+            bids = book.get("b", [])
+            asks = book.get("a", [])
+            if bids and asks:
+                bid = float(bids[0][0])
+                ask = float(asks[0][0])
+                if bid > 0:
+                    return round((ask - bid) / bid * 100, 2)
+            return None
+        except Exception:
+            return None
+
     def _check_frequency_limit(self) -> bool:
         """Check if trading frequency is within limits"""
         now = time.time()
@@ -224,6 +240,12 @@ class ExecutionEngine:
                 return
 
             if not self._check_frequency_limit():
+                return
+
+            # Spread check: reject if bid-ask spread > 2%
+            spread_pct = self._get_spread_pct(symbol)
+            if spread_pct is not None and spread_pct > 2.0:
+                logger.warning(f"[{symbol}] Spread too high: {spread_pct:.1f}% (max 2%). Skipping.")
                 return
 
             # Ensure minimum SL distance (0.5% of price safety floor)
