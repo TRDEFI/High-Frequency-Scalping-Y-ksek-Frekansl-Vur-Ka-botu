@@ -85,8 +85,3 @@ PRIVATE_WS_URL = (
     if IS_TESTNET else
     "wss://stream.bybit.com/v5/private"
 )
-PRIVATE_WS_URL = (
-    "wss://stream-testnet.bybit.com/v5/private"
-    if IS_TESTNET else
-    "wss://stream.bybit.com/v5/private"
-)

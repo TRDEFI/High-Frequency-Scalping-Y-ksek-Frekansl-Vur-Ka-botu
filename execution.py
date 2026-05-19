@@ -3,6 +3,7 @@ import time
 import threading
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
+from pybit.exceptions import InvalidRequestError
 import config
 
 logger = logging.getLogger(__name__)
@@ -219,21 +220,15 @@ class ExecutionEngine:
             if not self._check_frequency_limit():
                 return
 
+            # Ensure minimum SL distance (0.5% of price safety floor)
+            min_sl_dist = price * config.FALLBACK_SL_PCT
+            sl_distance = max(sl_distance, min_sl_dist)
+            tp_distance = max(tp_distance, min_sl_dist * config.RISK_REWARD_RATIO)
+
             sl_price = price - sl_distance if side == "Buy" else price + sl_distance
             tp_price = price + tp_distance if side == "Buy" else price - tp_distance
 
-            # Validate SL/TP against Bybit rules
-            if side == "Buy":
-                if sl_price >= price:
-                    sl_price = price * 0.998
-                if tp_price <= price:
-                    tp_price = price * 1.002
-            else:
-                if sl_price <= price:
-                    sl_price = price * 1.002
-                if tp_price >= price:
-                    tp_price = price * 0.998
-
+            # Round FIRST, then validate
             sl_str = self._round_price(symbol, sl_price)
             tp_str = self._round_price(symbol, tp_price)
             qty_str = self._get_dynamic_qty(symbol, price)
@@ -241,6 +236,16 @@ class ExecutionEngine:
             if qty_str == "0" or qty_str == "" or float(qty_str) <= 0:
                 logger.warning(f"[{symbol}] Invalid qty ({qty_str}). Skipping.")
                 return
+
+            # Post-rounding validation: ensure SL != TP and correct direction
+            if side == "Buy":
+                if float(sl_str) >= price or float(tp_str) <= price or sl_str == tp_str:
+                    sl_str = self._round_price(symbol, price * (1 - config.FALLBACK_SL_PCT))
+                    tp_str = self._round_price(symbol, price * (1 + config.FALLBACK_TP_PCT))
+            else:
+                if float(sl_str) <= price or float(tp_str) >= price or sl_str == tp_str:
+                    sl_str = self._round_price(symbol, price * (1 + config.FALLBACK_SL_PCT))
+                    tp_str = self._round_price(symbol, price * (1 - config.FALLBACK_TP_PCT))
 
             try:
                 logger.info(
@@ -274,6 +279,44 @@ class ExecutionEngine:
                     logger.info(f"[{symbol}] FILLED: {order_id}")
                 else:
                     logger.error(f"[{symbol}] REJECTED: {response}")
+
+            except InvalidRequestError as e:
+                err_msg = str(e)
+                # 30208/30209: Market order price outside Bybit price filter limits
+                if "30208" in err_msg or "30209" in err_msg:
+                    logger.warning(f"[{symbol}] Price limit ({err_msg[:60]}...). Retrying: market first, then SL/TP")
+                    try:
+                        resp = self.session.place_order(
+                            category=config.CATEGORY,
+                            symbol=symbol,
+                            side=side,
+                            orderType="Market",
+                            qty=qty_str,
+                            timeInForce="GTC",
+                            positionIdx=0,
+                        )
+                        if resp.get("retCode") == 0:
+                            oid = resp["result"]["orderId"]
+                            self.active_positions[symbol] = {"side": side, "time": time.time(), "qty": qty_str}
+                            self.trade_count += 1
+                            self.last_trade_time = now
+                            self.trades_last_hour.append(now)
+                            logger.info(f"[{symbol}] FILLED (retry): {oid}")
+                            self.session.set_trading_stop(
+                                category=config.CATEGORY,
+                                symbol=symbol,
+                                side=side,
+                                stopLoss=sl_str,
+                                takeProfit=tp_str,
+                                positionIdx=0,
+                            )
+                            logger.info(f"[{symbol}] SL/TP set post-fill")
+                        else:
+                            logger.error(f"[{symbol}] Retry failed: {resp}")
+                    except Exception as retry_e:
+                        logger.error(f"[{symbol}] Retry error: {retry_e}", exc_info=True)
+                else:
+                    logger.error(f"[{symbol}] Order error: {e}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"[{symbol}] Order error: {e}", exc_info=True)

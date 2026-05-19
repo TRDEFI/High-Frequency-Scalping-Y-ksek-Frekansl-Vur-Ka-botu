@@ -7,10 +7,10 @@ logger = logging.getLogger(__name__)
 
 class MultiPairDataFeed:
     """
-    MultiPairDataFeed v4.1
+    MultiPairDataFeed v4.2
     Connects to WebSocket and routes messages to correct StrategyProcessor.
     Subscriptions: Orderbook (L2), Klines (1m), Trade Stream
-    Health check: tracks last_seen to detect silent disconnects
+    Health check: per-stream last_seen tracking
     """
     def __init__(self, strategy_map: dict):
         self.strategy_map = strategy_map
@@ -19,17 +19,35 @@ class MultiPairDataFeed:
             channel_type=config.CATEGORY,
         )
         self.pairs = list(strategy_map.keys())
-        self.last_seen = time.time()
-        self._timeout_seconds = 30
 
-    def _mark_seen(self):
-        self.last_seen = time.time()
+        now = time.time()
+        self._last_seen_ob = now
+        self._last_seen_kline = now
+        self._last_seen_trade = now
+        self._timeout_seconds = 30
+        self._kline_timeout = 90
+
+    def _mark_seen_ob(self):
+        self._last_seen_ob = time.time()
+
+    def _mark_seen_kline(self):
+        self._last_seen_kline = time.time()
+
+    def _mark_seen_trade(self):
+        self._last_seen_trade = time.time()
 
     def is_alive(self) -> bool:
-        return (time.time() - self.last_seen) < self._timeout_seconds
+        now = time.time()
+        # Orderbook should be most frequent; if absent for 30s, suspect dead
+        if (now - self._last_seen_ob) > self._timeout_seconds:
+            return False
+        # Kline must arrive at least every 90s (1m candle + buffer)
+        if (now - self._last_seen_kline) > self._kline_timeout:
+            return False
+        return True
 
     def handle_orderbook(self, message):
-        self._mark_seen()
+        self._mark_seen_ob()
         data = message.get("data", {})
         if not data:
             return
@@ -42,7 +60,7 @@ class MultiPairDataFeed:
         self.strategy_map[symbol].update_orderbook(data, msg_type=msg_type)
 
     def handle_kline(self, message):
-        self._mark_seen()
+        self._mark_seen_kline()
         data = message.get("data", [])
         if not data:
             return
@@ -59,7 +77,7 @@ class MultiPairDataFeed:
                 self.strategy_map[symbol].update_kline(kline)
 
     def handle_trade(self, message):
-        self._mark_seen()
+        self._mark_seen_trade()
         if not config.ORDER_FLOW_ENABLED:
             return
             

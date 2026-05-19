@@ -83,18 +83,30 @@ class MultiPairBotOrchestrator:
         self.running = True
         self.data_feed.start()
 
+        self._heartbeat_ts = time.time()
+
         try:
             while self.running:
                 time.sleep(3)
 
                 # WebSocket health check
                 if not self.data_feed.is_alive():
-                    logger.error(f"DataFeed silent for >30s. Reconnecting...")
+                    logger.error(f"DataFeed silent. Reconnecting...")
                     self._reconnect_datafeed()
 
                 if self.execution_engine.active_positions:
                     self.execution_engine.update_positions_status()
                     self.execution_engine.update_funding_pnl()
+
+                # Heartbeat every 5 minutes
+                if time.time() - self._heartbeat_ts > 300:
+                    self._heartbeat_ts = time.time()
+                    logger.info(
+                        f"HEARTBEAT | Pairs: {len(self.pairs)} | "
+                        f"ActivePos: {len(self.execution_engine.active_positions)} | "
+                        f"Daily PnL: {self.execution_engine.daily_pnl:+.2f} | "
+                        f"Trades: {self.execution_engine.trade_count}"
+                    )
 
         except KeyboardInterrupt:
             self.stop()
