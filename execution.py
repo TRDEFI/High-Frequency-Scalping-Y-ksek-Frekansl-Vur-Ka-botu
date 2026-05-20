@@ -54,6 +54,9 @@ class ExecutionEngine:
         self.trades_last_hour = []
         self.symbol_last_trade_time = {}
         
+        # Track processed order IDs to avoid double-counting PnL
+        self._processed_order_ids = set()
+        
         # Load initial instrument info
         self._preload_instrument_info()
 
@@ -128,6 +131,7 @@ class ExecutionEngine:
             self.circuit_breaker_active = False
             self.trade_history = []
             self.trades_last_hour = []
+            self._processed_order_ids = set()
             self._day_start = today
 
     def _get_adaptive_position_size(self) -> float:
@@ -323,7 +327,6 @@ class ExecutionEngine:
 
             except InvalidRequestError as e:
                 err_msg = str(e)
-                # 30208/30209: Market order price outside Bybit price filter limits
                 if "30208" in err_msg or "30209" in err_msg:
                     logger.warning(f"[{symbol}] Price filter error. Retrying: market first, then SL/TP")
                     try:
@@ -345,7 +348,6 @@ class ExecutionEngine:
                             self.symbol_last_trade_time[symbol] = now
                             logger.info(f"[{symbol}] FILLED (retry): {oid}")
 
-                            # Step 2: Set SL/TP separately via set_trading_stop (with retry)
                             sl_set = False
                             for attempt in range(3):
                                 try:
@@ -374,6 +376,12 @@ class ExecutionEngine:
                                 logger.warning(f"[{symbol}] Position running WITHOUT SL/TP protection!")
                         else:
                             logger.error(f"[{symbol}] Retry failed: {resp}")
+                    except InvalidRequestError as retry_e:
+                        retry_msg = str(retry_e)
+                        if "30208" in retry_msg or "30209" in retry_msg:
+                            logger.error(f"[{symbol}] Retry also failed with price filter error. Skipping trade.")
+                        else:
+                            logger.error(f"[{symbol}] Retry error: {retry_e}", exc_info=True)
                     except Exception as retry_e:
                         logger.error(f"[{symbol}] Retry error: {retry_e}", exc_info=True)
                 else:
@@ -414,28 +422,46 @@ class ExecutionEngine:
             result = self.session.get_closed_pnl(
                 category=config.CATEGORY,
                 symbol=symbol,
-                limit=1,
+                limit=5,
             )
             trades = result.get("result", {}).get("list", [])
-            if trades:
-                pnl = float(trades[0].get("closedPnl", 0))
-                self.daily_pnl += pnl
+            if not trades:
+                return
 
-                self.trade_history.append({
-                    "symbol": symbol,
-                    "pnl": pnl,
-                    "timestamp": time.time()
-                })
+            latest = trades[0]
+            order_id = latest.get("orderId", "")
+            
+            if order_id in self._processed_order_ids:
+                return
+            self._processed_order_ids.add(order_id)
 
-                if pnl >= 0:
-                    self.win_count += 1
-                    self.consecutive_losses = 0
-                    logger.info(f"[{symbol}] TP HIT | PnL: {pnl:+.4f} | Total: {self.daily_pnl:+.4f}")
-                else:
-                    self.loss_count += 1
-                    self.consecutive_losses += 1
-                    self.last_loss_time = time.time()
-                    logger.info(f"[{symbol}] SL HIT | PnL: {pnl:+.4f} | Total: {self.daily_pnl:+.4f}")
+            pnl = float(latest.get("closedPnl", 0))
+            exec_qty = float(latest.get("qty", 0))
+            entry_px = float(latest.get("entryPrice", 0))
+            exit_px = float(latest.get("exitPrice", 0))
+            open_fee = float(latest.get("openOrderFee", 0))
+            close_fee = float(latest.get("closeOrderFee", 0))
+            
+            self.daily_pnl += pnl
+
+            self.trade_history.append({
+                "symbol": symbol,
+                "pnl": pnl,
+                "timestamp": time.time()
+            })
+
+            if pnl >= 0:
+                self.win_count += 1
+                self.consecutive_losses = 0
+                logger.info(f"[{symbol}] TP HIT | PnL: {pnl:+.4f} | Total: {self.daily_pnl:+.4f}")
+            else:
+                self.loss_count += 1
+                self.consecutive_losses += 1
+                self.last_loss_time = time.time()
+                logger.info(f"[{symbol}] SL HIT | PnL: {pnl:+.4f} | Total: {self.daily_pnl:+.4f}")
+
+            logger.debug(f"[{symbol}] PnL DEBUG | entry={entry_px} exit={exit_px} qty={exec_qty} "
+                        f"fees={open_fee+close_fee:.4f} net_pnl={pnl:+.4f}")
 
         except Exception as e:
             logger.error(f"[{symbol}] Error fetching closed PnL: {e}")
